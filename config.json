@@ -4,7 +4,7 @@
     "supervisor": "qwen3.5:35b-a3b",
     "code_worker": "qwen3-coder:30b",
     "ui_worker": "glm4.7-flash:latest",
-    "retriever": "glm4.7-flash:latest"
+    "retriever": "glm-4.7-flash:latest"
   },
   "paths": {
     "runs_dir": "runs",
