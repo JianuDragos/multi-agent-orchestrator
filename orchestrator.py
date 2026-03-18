@@ -158,8 +158,8 @@ def format_raw_response_for_display(raw_text: str) -> str:
                 key=lambda item: (len(item["object"]), item["index"])
             )
             return json.dumps(best["object"], indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return f"[display parse warning: {type(exc).__name__}]\n{text[:2000]}"
 
     if "{" in text and "}" in text:
         start = text.find("{")
@@ -168,6 +168,90 @@ def format_raw_response_for_display(raw_text: str) -> str:
             return text[start:end]
 
     return text
+
+
+def context_grounding_problems(plan: dict, used_context_files: list[str]):
+    problems = []
+
+    if not isinstance(plan, dict):
+        return ["plan is not a JSON object for grounding validation"]
+
+    used = {str(x).strip() for x in used_context_files if str(x).strip()}
+
+    files_to_modify = [str(x).strip() for x in plan.get("files_to_modify", []) if str(x).strip()]
+    evidence_files = []
+
+    evidence = plan.get("evidence", [])
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                f = str(item.get("file", "")).strip()
+                if f:
+                    evidence_files.append(f)
+
+    missing_modify = [f for f in files_to_modify if f not in used]
+    missing_evidence = [f for f in evidence_files if f not in used]
+
+    for f in missing_modify:
+        problems.append(f"files_to_modify not grounded in used context: {f}")
+
+    for f in missing_evidence:
+        problems.append(f"evidence file not grounded in used context: {f}")
+
+    return problems
+
+
+def print_grounding_debug(label: str, plan: dict, used_context_files: list[str]):
+    evidence = plan.get("evidence", [])
+    evidence_files = []
+
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                f = str(item.get("file", "")).strip()
+                if f:
+                    evidence_files.append(f)
+
+    files_to_modify = [str(x) for x in plan.get("files_to_modify", [])]
+    files_to_avoid = [str(x) for x in plan.get("files_to_avoid", [])]
+
+    print(f"\n=== {label} grounding ===")
+    print("Used context files:")
+    for f in used_context_files:
+        print("-", f)
+
+    print("Evidence files:")
+    if evidence_files:
+        for f in evidence_files:
+            print("-", f)
+    else:
+        print("(none)")
+
+    print("Files to modify:")
+    if files_to_modify:
+        for f in files_to_modify:
+            print("-", f)
+    else:
+        print("(none)")
+
+    print("Files to avoid:")
+    if files_to_avoid:
+        for f in files_to_avoid:
+            print("-", f)
+    else:
+        print("(none)")
+
+    missing_from_context = [f for f in files_to_modify if f not in used_context_files]
+    if missing_from_context:
+        print("Modify files not present in used context:")
+        for f in missing_from_context:
+            print("-", f)
+
+    evidence_not_in_context = [f for f in evidence_files if f not in used_context_files]
+    if evidence_not_in_context:
+        print("Evidence files not present in used context:")
+        for f in evidence_not_in_context:
+            print("-", f)
 
 
 def run_json_stage(client, role, prompt, expected_keys, validator, validation_context, task, label):
@@ -305,6 +389,9 @@ Rules:
 - Use ONLY real file paths from "All real project files".
 - Do not invent filenames.
 - Stay strictly on the requested task.
+- If the task mentions visible UI elements or page behavior (button, form, input, navbar, modal, page, layout, template), consider both rendering files and behavior files.
+- If the task mentions paired or opposite actions (increase/decrease, open/close, show/hide, enable/disable), the plan must explicitly cover both actions.
+- Do not place likely rendering files (.html, .htm, .jinja, .j2, template files) in files_to_avoid unless evidence clearly shows they are irrelevant.
 - Do not propose unrelated enhancements.
 - Do not propose optional UX improvements, animations, notifications, refactors, cleanup, or extra features unless the task explicitly asks for them.
 - Do not include orchestration metadata or repository-management steps.
@@ -337,6 +424,9 @@ Rules:
         label="Coordinator",
     )
 
+    coordinator_validation_problems.extend(context_grounding_problems(coordinator_plan, used_context_files))
+    coordinator_validation_problems = list(dict.fromkeys(coordinator_validation_problems))
+
     if coordinator_validation_problems:
         coordinator_repair_prompt = coordinator_prompt_base + f"""
 
@@ -368,18 +458,22 @@ Do not repeat the same invalid paths or schema mistakes.
             label="Coordinator repair",
         )
 
+        repaired_coordinator_problems.extend(context_grounding_problems(repaired_coordinator_plan, used_context_files))
+        repaired_coordinator_problems = list(dict.fromkeys(repaired_coordinator_problems))
+
         if len(repaired_coordinator_problems) <= len(coordinator_validation_problems):
             coordinator_plan = repaired_coordinator_plan
             coordinator_validation_problems = repaired_coordinator_problems
 
     supervisor_prompt_base = f"""
-You are a specialized JSON generator acting as the supervisor in a multi-agent coding system.
+You are a specialized JSON generator acting as a skeptical supervisor in a multi-agent coding system.
 You are NOT a chat assistant.
 Do not use chain-of-thought.
 Do not write "Thinking..." or explanations.
 Start your response with {{ and end with }}.
 
-Your job is to review the coordinator plan, correct it if needed, and return exactly one JSON object.
+Your job is to find reasons the coordinator plan may fail, correct it if needed, and return exactly one JSON object.
+Prefer rejecting weakly grounded or incomplete plans rather than agreeing too easily.
 
 PRIMARY TASK TO SOLVE:
 {task}
@@ -429,6 +523,9 @@ Hard rules:
 - Prefer minimal safe changes.
 - Reject invented paths.
 - Reject unnecessarily broad changes.
+- If the task mentions visible UI elements or page behavior (button, form, input, navbar, modal, page, layout, template), expect the final plan to consider both rendering files and behavior files when appropriate.
+- If the task mentions paired or opposite actions (increase/decrease, open/close, show/hide, enable/disable), reject plans that clearly cover only one side of the behavior.
+- Reject plans that place likely rendering files (.html, .htm, .jinja, .j2, template files) in files_to_avoid without clear evidence.
 - Do not add unrelated enhancements or adjacent features.
 - Do not include orchestration metadata, path normalization instructions, or repository-management steps.
 - STRICT LIMIT: Maximum 3 files_to_modify unless absolutely necessary.
@@ -462,6 +559,9 @@ Hard rules:
         label="Supervisor",
     )
 
+    supervisor_validation_problems.extend(context_grounding_problems(supervisor_plan, used_context_files))
+    supervisor_validation_problems = list(dict.fromkeys(supervisor_validation_problems))
+
     if supervisor_validation_problems:
         supervisor_repair_prompt = supervisor_prompt_base + f"""
 
@@ -493,6 +593,9 @@ Do not repeat the same invalid paths or schema mistakes.
             task=task,
             label="Supervisor repair",
         )
+
+        repaired_supervisor_problems.extend(context_grounding_problems(repaired_supervisor_plan, used_context_files))
+        repaired_supervisor_problems = list(dict.fromkeys(repaired_supervisor_problems))
 
         if len(repaired_supervisor_problems) <= len(supervisor_validation_problems):
             supervisor_plan = repaired_supervisor_plan
@@ -581,6 +684,8 @@ Hard rules:
 - Do not mention orchestration, path normalization, repo management, or file path reference changes.
 - Keep the aider_task concise, direct, and implementation-focused.
 - The aider_task must preserve every listed constraint.
+- The aider_task must incorporate the practical reasoning from evidence so the implementation tool understands why each chosen file matters.
+- Do not drop the file-specific rationale from evidence when writing aider_task.
 """.strip()
 
     print(f"\n[3/3] Asking {selected_worker_role}...")
