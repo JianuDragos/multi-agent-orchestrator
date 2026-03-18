@@ -1,13 +1,13 @@
-# Medii virtuale Python
+# Virtual Python
 .venv/
 venv/
 env/
 
-# Cache și fișiere compilate Python
+# Cache 
 __pycache__/
 *.pyc
 
-# Directoare create de orchestratorul tău
+
 runs/
 memory/
 *.bak*
