@@ -4,6 +4,7 @@ from pathlib import Path
 
 from tools.ollama_client import OllamaClient
 from tools.project_scan import build_project_tree, collect_relevant_files, read_file_safe
+from tools.retrieval_rank import collect_relevant_files_scored
 from tools.json_utils import extract_json_candidates
 from tools.plan_validation import (
     normalize_list,
@@ -109,6 +110,20 @@ STOPWORDS = {
     "just", "make", "does", "page", "file", "files", "task"
 }
 
+NOVELTY_PROSE_STOPWORDS = {
+    "actual", "actually", "blocking", "blocked", "cause", "causes", "causing",
+    "check", "checks", "checking", "code", "logic", "issue", "issues", "root",
+    "current", "currently", "verify", "verifies", "verifying", "ensure",
+    "ensures", "ensuring", "behavior", "correct", "correctly", "request",
+    "requests", "response", "responses", "submit", "submits", "submission",
+    "form", "forms", "route", "routes", "handler", "handlers", "endpoint",
+    "endpoints", "problem", "problems", "value", "values", "action", "actions",
+    "button", "buttons", "template", "templates", "functionality",
+    "contains", "contain", "including", "include", "inside", "locate",
+    "review", "modify", "change", "test", "maintain", "maintains", "remain",
+    "remains", "functional", "consistent", "targeting", "points", "point"
+}
+
 
 def _tokenize_text(text: str):
     return [
@@ -159,12 +174,11 @@ def _task_alignment_problems(plan, task):
     return []
 
 
-def context_relevance_problems(plan: dict, task: str, used_context_files: list[str]):
+def context_relevance_problems(plan: dict, used_context_files: list[str], used_context_score_map: dict, used_context_match_count_map: dict):
     if not isinstance(plan, dict):
         return []
 
-    task_tokens = set(_tokenize_text(task))
-    if not task_tokens:
+    if not used_context_files or not used_context_score_map:
         return []
 
     files_to_modify = {str(x).strip() for x in normalize_list(plan.get("files_to_modify", []))}
@@ -180,30 +194,50 @@ def context_relevance_problems(plan: dict, task: str, used_context_files: list[s
                     evidence_files.add(f)
 
     addressed = files_to_modify | files_to_avoid | evidence_files
+    top_score = max(used_context_score_map.get(path, 0) for path in used_context_files)
+    if top_score < 8:
+        return []
+
+    generic_basenames = {"app", "config", "database", "models", "index", "base", "main", "utils", "helpers"}
     problems = []
 
     for path in used_context_files:
-        overlap = task_tokens.intersection(_tokenize_path(path))
-        if overlap and path not in addressed:
-            problems.append(f"used context file appears relevant but is not addressed: {path}")
+        score = used_context_score_map.get(path, 0)
+        matched_count = used_context_match_count_map.get(path, 0)
+        stem = Path(path).stem.lower()
 
-    return problems
+        if stem in generic_basenames:
+            continue
+
+        # General rule:
+        # only flag ignored files that were retrieved strongly AND matched multiple distinct keywords
+        if score >= max(8, top_score - 2) and matched_count >= 2 and path not in addressed:
+            problems.append(f"high-priority multi-signal retrieved file not addressed: {path}")
+
+    return problems[:2]
+
+
+TECH_NOVELTY_TERMS = {
+    "ajax", "fetch", "axios", "websocket", "graphql", "stripe", "paypal",
+    "redis", "celery", "kafka", "rabbitmq", "docker", "nginx", "s3",
+    "jwt", "oauth", "grpc", "redux", "zustand", "pinia", "socketio",
+    "prisma", "typeorm", "sequelize", "alembic", "flyway", "supabase",
+    "firebase", "nextauth", "passport", "bullmq", "airflow"
+}
 
 
 def unsupported_novelty_problems(plan: dict, task: str, used_context_files: list[str], relevant_context: str):
     if not isinstance(plan, dict):
         return []
 
-    allowed_tokens = set(_tokenize_text(task))
-    allowed_tokens.update(_tokenize_text(" ".join(used_context_files)))
-    allowed_tokens.update(_tokenize_text(relevant_context))
+    plan_text = _flatten_plan_text(plan).lower()
+    allowed_text_parts = [str(task).lower(), " ".join(used_context_files).lower(), str(relevant_context).lower()]
 
-    # also allow tokens that come from plan file paths themselves
     for f in normalize_list(plan.get("files_to_modify", [])):
-        allowed_tokens.update(_tokenize_path(f))
+        allowed_text_parts.append(str(f).lower())
 
     for f in normalize_list(plan.get("files_to_avoid", [])):
-        allowed_tokens.update(_tokenize_path(f))
+        allowed_text_parts.append(str(f).lower())
 
     evidence = plan.get("evidence", [])
     if isinstance(evidence, list):
@@ -211,21 +245,14 @@ def unsupported_novelty_problems(plan: dict, task: str, used_context_files: list
             if isinstance(item, dict):
                 f = str(item.get("file", "")).strip()
                 if f:
-                    allowed_tokens.update(_tokenize_path(f))
+                    allowed_text_parts.append(f.lower())
 
-    plan_tokens = _tokenize_text(_flatten_plan_text(plan))
-    counts = {}
+    allowed_text = "\n".join(allowed_text_parts)
 
-    for tok in plan_tokens:
-        if tok not in allowed_tokens:
-            counts[tok] = counts.get(tok, 0) + 1
-
-    suspicious = sorted(
-        [tok for tok, count in counts.items() if count >= 2 and len(tok) >= 4]
-    )[:6]
+    suspicious = [term for term in sorted(TECH_NOVELTY_TERMS) if term in plan_text and term not in allowed_text]
 
     if suspicious:
-        return [f"plan introduces unsupported terms not grounded in task/context: {', '.join(suspicious)}"]
+        return [f"plan introduces unsupported technical mechanisms not grounded in task/context: {', '.join(suspicious[:6])}"]
 
     return []
 
@@ -611,11 +638,25 @@ def main():
     for kw in keywords:
         print("-", kw)
 
-    relevant_files = collect_relevant_files(str(root), keywords=keywords, max_files=max_context_files)
+    ranked_relevant_files = collect_relevant_files_scored(
+        str(root),
+        keywords=keywords,
+        max_files=max_context_files,
+    )
+    relevant_files = [item["path"] for item in ranked_relevant_files]
+    relevant_score_map = {
+        str(item["path"].relative_to(root)).replace("\\", "/"): item["score"]
+        for item in ranked_relevant_files
+    }
+    relevant_match_count_map = {
+        str(item["path"].relative_to(root)).replace("\\", "/"): item["matched_count"]
+        for item in ranked_relevant_files
+    }
 
     print("\n=== Relevant files selected ===")
-    for f in relevant_files:
-        print("-", f.relative_to(root))
+    for item in ranked_relevant_files:
+        rel = item["path"].relative_to(root)
+        print(f"- {rel}  [score={item['score']}, matched={item['matched_count']}]")
 
     relevant_context, used_context_files, total_context_chars = build_relevant_context(
         relevant_files=relevant_files,
@@ -623,6 +664,14 @@ def main():
         max_file_chars=max_file_chars,
         max_total_context_chars=max_total_context_chars,
     )
+    used_context_score_map = {
+        path: relevant_score_map.get(path, 0)
+        for path in used_context_files
+    }
+    used_context_match_count_map = {
+        path: relevant_match_count_map.get(path, 0)
+        for path in used_context_files
+    }
 
     print("\n=== Context budget ===")
     print(f"Used files in context: {len(used_context_files)}")
@@ -724,7 +773,7 @@ Rules:
     print_grounding_debug("Coordinator", coordinator_plan, used_context_files)
 
     coordinator_validation_problems.extend(context_grounding_problems(coordinator_plan, used_context_files))
-    coordinator_validation_problems.extend(context_relevance_problems(coordinator_plan, task, used_context_files))
+    coordinator_validation_problems.extend(context_relevance_problems(coordinator_plan, used_context_files, used_context_score_map, used_context_match_count_map))
     coordinator_validation_problems.extend(unsupported_novelty_problems(coordinator_plan, task, used_context_files, relevant_context))
     coordinator_validation_problems = list(dict.fromkeys(coordinator_validation_problems))
 
@@ -760,7 +809,7 @@ Do not repeat the same invalid paths or schema mistakes.
         )
 
         repaired_coordinator_problems.extend(context_grounding_problems(repaired_coordinator_plan, used_context_files))
-        repaired_coordinator_problems.extend(context_relevance_problems(repaired_coordinator_plan, task, used_context_files))
+        repaired_coordinator_problems.extend(context_relevance_problems(repaired_coordinator_plan, used_context_files, used_context_score_map, used_context_match_count_map))
         repaired_coordinator_problems.extend(unsupported_novelty_problems(repaired_coordinator_plan, task, used_context_files, relevant_context))
         repaired_coordinator_problems = list(dict.fromkeys(repaired_coordinator_problems))
 
@@ -800,7 +849,7 @@ Do not repeat the same invalid paths or schema mistakes.
     print_grounding_debug("Supervisor", supervisor_plan, used_context_files)
 
     supervisor_validation_problems.extend(context_grounding_problems(supervisor_plan, used_context_files))
-    supervisor_validation_problems.extend(context_relevance_problems(supervisor_plan, task, used_context_files))
+    supervisor_validation_problems.extend(context_relevance_problems(supervisor_plan, used_context_files, used_context_score_map, used_context_match_count_map))
     supervisor_validation_problems.extend(unsupported_novelty_problems(supervisor_plan, task, used_context_files, relevant_context))
     supervisor_validation_problems = list(dict.fromkeys(supervisor_validation_problems))
 
@@ -837,7 +886,7 @@ Do not repeat the same invalid paths or schema mistakes.
         )
 
         repaired_supervisor_problems.extend(context_grounding_problems(repaired_supervisor_plan, used_context_files))
-        repaired_supervisor_problems.extend(context_relevance_problems(repaired_supervisor_plan, task, used_context_files))
+        repaired_supervisor_problems.extend(context_relevance_problems(repaired_supervisor_plan, used_context_files, used_context_score_map, used_context_match_count_map))
         repaired_supervisor_problems.extend(unsupported_novelty_problems(repaired_supervisor_plan, task, used_context_files, relevant_context))
         repaired_supervisor_problems = list(dict.fromkeys(repaired_supervisor_problems))
 
@@ -896,7 +945,7 @@ Do not invent unsupported mechanisms or new architecture unless it is grounded i
         print_grounding_debug("Coordinator revision", revised_coordinator_plan, used_context_files)
 
         revised_coordinator_problems.extend(context_grounding_problems(revised_coordinator_plan, used_context_files))
-        revised_coordinator_problems.extend(context_relevance_problems(revised_coordinator_plan, task, used_context_files))
+        revised_coordinator_problems.extend(context_relevance_problems(revised_coordinator_plan, used_context_files, used_context_score_map, used_context_match_count_map))
         revised_coordinator_problems.extend(unsupported_novelty_problems(revised_coordinator_plan, task, used_context_files, relevant_context))
         revised_coordinator_problems = list(dict.fromkeys(revised_coordinator_problems))
 
@@ -936,7 +985,7 @@ Do not invent unsupported mechanisms or new architecture unless it is grounded i
         print_grounding_debug("Supervisor re-review", supervisor_plan, used_context_files)
 
         supervisor_validation_problems.extend(context_grounding_problems(supervisor_plan, used_context_files))
-        supervisor_validation_problems.extend(context_relevance_problems(supervisor_plan, task, used_context_files))
+        supervisor_validation_problems.extend(context_relevance_problems(supervisor_plan, used_context_files, used_context_score_map, used_context_match_count_map))
         supervisor_validation_problems.extend(unsupported_novelty_problems(supervisor_plan, task, used_context_files, relevant_context))
         supervisor_validation_problems = list(dict.fromkeys(supervisor_validation_problems))
 
