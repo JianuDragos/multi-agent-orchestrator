@@ -10,3 +10,5 @@ __pycache__/
 # Directoare create de orchestratorul tău
 runs/
 memory/
+*.bak*
+*before_*

@@ -5,7 +5,7 @@ import re
 STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "without",
     "fix", "update", "change", "modify", "make", "add", "remove", "improve", "issue",
-    "bug", "problem", "button", "logic", "task", "file", "files"
+    "bug", "problem", "button", "buttons", "logic", "task", "file", "files"
 }
 
 
@@ -94,14 +94,7 @@ def _tokenize(text):
     return [w for w in words if len(w) >= 3 and w not in STOPWORDS]
 
 
-def _task_alignment_problems(plan, task):
-    if not task:
-        return []
-
-    task_tokens = set(_tokenize(task))
-    if not task_tokens:
-        return []
-
+def _plan_text(plan):
     probable_cause = str(plan.get("probable_cause", ""))
     reason = str(plan.get("reason", ""))
     steps = " ".join(normalize_list(plan.get("steps", [])))
@@ -116,7 +109,7 @@ def _task_alignment_problems(plan, task):
                 evidence_parts.append(str(item.get("file", "")))
                 evidence_parts.append(str(item.get("reason", "")))
 
-    plan_text = " ".join([
+    return " ".join([
         probable_cause,
         reason,
         steps,
@@ -124,6 +117,17 @@ def _task_alignment_problems(plan, task):
         files_to_modify,
         " ".join(evidence_parts),
     ]).lower()
+
+
+def _task_alignment_problems(plan, task):
+    if not task:
+        return []
+
+    task_tokens = set(_tokenize(task))
+    if not task_tokens:
+        return []
+
+    plan_text = _plan_text(plan)
 
     matched = sorted(token for token in task_tokens if token in plan_text)
     match_ratio = len(matched) / max(len(task_tokens), 1)
@@ -177,6 +181,7 @@ def _validate_evidence(plan, real_files):
             problems.append(f"files_to_modify path is not justified in evidence: {nf}")
 
     return problems
+
 
 
 def validate_coordinator_plan(plan, real_files, task=None):
