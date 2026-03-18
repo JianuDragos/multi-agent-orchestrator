@@ -15,8 +15,8 @@
     "max_total_context_chars": 40000
   },
   "ollama": {
-    "base_url": "http://127.0.0.1:11434",
-    "timeout_sec": 90,
+    "base_url": "http://127.0.0.1:11434/api",
+    "timeout_sec": 300,
     "max_retries": 1,
     "base_backoff_sec": 1,
     "think": false,
