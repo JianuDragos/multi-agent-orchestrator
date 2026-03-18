@@ -15,7 +15,7 @@ IGNORED_DIRS = {
 }
 
 
-def build_project_tree(root: str, max_depth: int = 5) -> str:
+def build_project_tree(root: str, max_depth: int = 5, max_entries_per_dir: int = 50) -> str:
     root_path = Path(root).resolve()
     lines = [root_path.name + "/"]
 
@@ -31,18 +31,47 @@ def build_project_tree(root: str, max_depth: int = 5) -> str:
         except PermissionError:
             return
 
+        hidden_count = 0
+        if len(entries) > max_entries_per_dir:
+            hidden_count = len(entries) - max_entries_per_dir
+            entries = entries[:max_entries_per_dir]
+
         for i, entry in enumerate(entries):
-            is_last = i == len(entries) - 1
+            is_last = (i == len(entries) - 1) and hidden_count == 0
             connector = "└── " if is_last else "├── "
             suffix = "/" if entry.is_dir() else ""
+
             lines.append(f"{prefix}{connector}{entry.name}{suffix}")
 
             if entry.is_dir():
                 next_prefix = prefix + ("    " if is_last else "│   ")
                 walk(entry, next_prefix, depth + 1)
 
+        if hidden_count > 0:
+            lines.append(f"{prefix}└── ... ({hidden_count} more entries)")
+
     walk(root_path)
     return "\n".join(lines)
+
+
+def _truncate_text(text: str, max_chars: int, trailer: str = "\n...[TRUNCATED]...") -> str:
+    if len(text) <= max_chars:
+        return text
+
+    budget = max_chars - len(trailer)
+    if budget <= 0:
+        return trailer[:max_chars]
+
+    return text[:budget] + trailer
+
+
+def _py_signature(prefix: str, name: str, args_node) -> str:
+    try:
+        args_text = ast.unparse(args_node)
+    except Exception:
+        args = [a.arg for a in getattr(args_node, "args", [])]
+        args_text = ", ".join(args)
+    return f"{prefix} {name}({args_text}): ..."
 
 
 def _py_skeleton(content: str) -> str:
@@ -52,27 +81,61 @@ def _py_skeleton(content: str) -> str:
         return ""
 
     out = []
+
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            out.append(ast.get_source_segment(content, node) or "")
+            try:
+                out.append(ast.unparse(node))
+            except Exception:
+                src = ast.get_source_segment(content, node)
+                if src:
+                    out.append(src)
+
         elif isinstance(node, ast.ClassDef):
-            out.append(f"class {node.name}:")
+            bases = ""
+            if node.bases:
+                try:
+                    bases_text = ", ".join(ast.unparse(base) for base in node.bases)
+                    bases = f"({bases_text})"
+                except Exception:
+                    bases = ""
+
+            out.append(f"class {node.name}{bases}:")
             for child in node.body:
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    args = [a.arg for a in child.args.args]
-                    prefix = "async def" if isinstance(child, ast.AsyncFunctionDef) else "def"
-                    out.append(f"    {prefix} {child.name}({', '.join(args)}): ...")
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            args = [a.arg for a in node.args.args]
-            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-            out.append(f"{prefix} {node.name}({', '.join(args)}): ...")
+                if isinstance(child, ast.FunctionDef):
+                    out.append("    " + _py_signature("def", child.name, child.args))
+                elif isinstance(child, ast.AsyncFunctionDef):
+                    out.append("    " + _py_signature("async def", child.name, child.args))
+
+        elif isinstance(node, ast.FunctionDef):
+            out.append(_py_signature("def", node.name, node.args))
+
+        elif isinstance(node, ast.AsyncFunctionDef):
+            out.append(_py_signature("async def", node.name, node.args))
 
     return "\n".join(line for line in out if line.strip())
+
+
+def _collect_multiline_signature(lines, start_index, max_follow: int = 6):
+    collected = [lines[start_index]]
+    end_index = start_index
+
+    for i in range(start_index + 1, min(len(lines), start_index + 1 + max_follow)):
+        nxt = lines[i]
+        if not nxt.strip():
+            break
+        collected.append(nxt)
+        end_index = i
+        if any(ch in nxt for ch in [")", "{", "=>", ":"]):
+            break
+
+    return "\n".join(collected), end_index
 
 
 def _js_ts_skeleton(content: str) -> str:
     lines = content.splitlines()
     kept = []
+    i = 0
 
     patterns = (
         r"^\s*import\s+",
@@ -89,11 +152,16 @@ def _js_ts_skeleton(content: str) -> str:
         r"^\s*window\.",
     )
 
-    for line in lines:
+    while i < len(lines):
+        line = lines[i]
         if any(re.search(pat, line) for pat in patterns):
-            kept.append(line)
+            block, end_index = _collect_multiline_signature(lines, i)
+            kept.append(block)
+            i = end_index + 1
+            continue
+        i += 1
 
-    return "\n".join(kept)
+    return "\n\n".join(block for block in kept if block.strip())
 
 
 def _html_skeleton(content: str) -> str:
@@ -136,17 +204,20 @@ def read_file_safe(path: Path, max_chars: int = 12000) -> str:
     if suffix == ".py":
         skeleton = _py_skeleton(content)
         if skeleton.strip():
-            return skeleton + f"\n\n...[python skeleton extracted from {len(content)} chars]..."
+            final_skeleton = skeleton + f"\n\n...[python skeleton extracted from {len(content)} chars]..."
+            return _truncate_text(final_skeleton, max_chars, "\n...[PYTHON SKELETON TRUNCATED]...")
 
     if suffix in {".js", ".ts", ".jsx", ".tsx"}:
         skeleton = _js_ts_skeleton(content)
         if skeleton.strip():
-            return skeleton + f"\n\n...[js/ts skeleton extracted from {len(content)} chars]..."
+            final_skeleton = skeleton + f"\n\n...[js/ts skeleton extracted from {len(content)} chars]..."
+            return _truncate_text(final_skeleton, max_chars, "\n...[JS/TS SKELETON TRUNCATED]...")
 
     if suffix in {".html", ".htm", ".jinja", ".j2"}:
         skeleton = _html_skeleton(content)
         if skeleton.strip():
-            return skeleton + f"\n\n...[html skeleton extracted from {len(content)} chars]..."
+            final_skeleton = skeleton + f"\n\n...[html skeleton extracted from {len(content)} chars]..."
+            return _truncate_text(final_skeleton, max_chars, "\n...[HTML SKELETON TRUNCATED]...")
 
     head = content[: max_chars // 2]
     tail = content[-max_chars // 2 :]
@@ -181,13 +252,13 @@ def collect_relevant_files(root: str, keywords=None, max_files: int = 8):
 
         rel = str(path.relative_to(root_path)).replace("\\", "/")
         rel_lower = rel.lower()
-        name_lower = path.name.lower()
+        stem_lower = path.stem.lower()
         tokens = _path_tokens(root_path, path)
 
         score = 0
 
         for kw in normalized_keywords:
-            if kw == name_lower:
+            if kw == stem_lower:
                 score += 10
             if kw in tokens:
                 score += 7
