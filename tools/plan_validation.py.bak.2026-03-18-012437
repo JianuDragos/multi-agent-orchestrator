@@ -1,0 +1,95 @@
+def normalize_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value]
+    return [str(value)]
+
+
+def _validate_paths(paths, real_files, field_name):
+    problems = []
+    for path in normalize_list(paths):
+        if path not in real_files:
+            problems.append(f"{field_name} contains non-existent path: {path}")
+    return problems
+
+
+def _validate_no_overlap(a, b, left_name, right_name):
+    left = set(normalize_list(a))
+    right = set(normalize_list(b))
+    overlap = sorted(left & right)
+    return [
+        f"path appears in both {left_name} and {right_name}: {path}"
+        for path in overlap
+    ]
+
+
+def validate_coordinator_plan(plan, real_files):
+    problems = []
+
+    if not isinstance(plan, dict):
+        return ["Coordinator plan is not a JSON object"]
+
+    task_type = str(plan.get("task_type", "")).strip().lower()
+    if task_type not in {"code", "ui", "mixed"}:
+        problems.append(f"invalid task_type: {task_type!r}")
+
+    probable_cause = str(plan.get("probable_cause", "")).strip()
+    if not probable_cause:
+        problems.append("probable_cause is missing or empty")
+
+    files_to_modify = normalize_list(plan.get("files_to_modify", []))
+    files_to_avoid = normalize_list(plan.get("files_to_avoid", []))
+    steps = normalize_list(plan.get("steps", []))
+    risks = normalize_list(plan.get("risks", []))
+
+    if not files_to_modify:
+        problems.append("files_to_modify is missing or empty")
+    if not steps:
+        problems.append("steps is missing or empty")
+    if not risks:
+        problems.append("risks is missing or empty")
+
+    problems.extend(_validate_paths(files_to_modify, real_files, "files_to_modify"))
+    problems.extend(_validate_paths(files_to_avoid, real_files, "files_to_avoid"))
+    problems.extend(_validate_no_overlap(files_to_modify, files_to_avoid, "files_to_modify", "files_to_avoid"))
+
+    return problems
+
+
+def validate_supervisor_plan(plan, real_files):
+    problems = []
+
+    if not isinstance(plan, dict):
+        return ["Supervisor plan is not a JSON object"]
+
+    approved = plan.get("approved", None)
+    if not isinstance(approved, bool):
+        problems.append("approved must be a boolean")
+
+    worker = str(plan.get("worker", "")).strip().lower()
+    if worker not in {"code", "ui"}:
+        problems.append(f"invalid worker: {worker!r}")
+
+    reason = str(plan.get("reason", "")).strip()
+    if not reason:
+        problems.append("reason is missing or empty")
+
+    files_to_modify = normalize_list(plan.get("files_to_modify", []))
+    files_to_avoid = normalize_list(plan.get("files_to_avoid", []))
+    constraints = normalize_list(plan.get("constraints", []))
+    corrected_steps = normalize_list(plan.get("corrected_steps", []))
+
+    if not files_to_modify:
+        problems.append("files_to_modify is missing or empty")
+    if not corrected_steps:
+        problems.append("corrected_steps is missing or empty")
+
+    if "constraints" not in plan:
+        problems.append('constraints field is missing')
+
+    problems.extend(_validate_paths(files_to_modify, real_files, "files_to_modify"))
+    problems.extend(_validate_paths(files_to_avoid, real_files, "files_to_avoid"))
+    problems.extend(_validate_no_overlap(files_to_modify, files_to_avoid, "files_to_modify", "files_to_avoid"))
+
+    return problems

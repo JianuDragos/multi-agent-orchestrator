@@ -1,0 +1,91 @@
+import json
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+class OllamaClient:
+    def __init__(self, config_path: str = "config.json"):
+        self.config_path = Path(config_path)
+        self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
+
+        ollama_cfg = self.config.get("ollama", {})
+        self.base_url = str(ollama_cfg.get("base_url", "http://127.0.0.1:11434")).rstrip("/")
+        self.timeout_sec = int(ollama_cfg.get("timeout_sec", 90))
+        self.max_retries = int(ollama_cfg.get("max_retries", 1))
+        self.base_backoff_sec = int(ollama_cfg.get("base_backoff_sec", 1))
+        self.keep_alive_default = ollama_cfg.get("keep_alive_default", "5m")
+        self.keep_alive_by_role = ollama_cfg.get("keep_alive_by_role", {})
+        self.options_default = ollama_cfg.get("options", {})
+        self.think = bool(ollama_cfg.get("think", False))
+
+    def get_model(self, role: str) -> str:
+        return self.config["models"][role]
+
+    def get_keep_alive(self, role: str):
+        return self.keep_alive_by_role.get(role, self.keep_alive_default)
+
+    def _post_json(self, endpoint: str, payload: dict) -> dict:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url=f"{self.base_url}{endpoint}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid JSON from Ollama API:\n{raw}") from exc
+
+    def generate(self, role: str, prompt: str) -> str:
+        model = self.get_model(role)
+        keep_alive = self.get_keep_alive(role)
+        last_error = None
+
+        for attempt in range(1, self.max_retries + 1):
+            print(f"[OllamaAPI] role={role} model={model} attempt={attempt}/{self.max_retries}")
+            try:
+                payload = {
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "think": self.think,
+                    "keep_alive": keep_alive,
+                    "options": self.options_default,
+                }
+
+                data = self._post_json("/api/generate", payload)
+                text = str(data.get("response", "")).strip()
+
+                if text:
+                    return text
+
+                last_error = f"Empty Ollama response for role '{role}' with model '{model}'. Payload succeeded but response was empty."
+
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                last_error = (
+                    f"Ollama HTTP error for role '{role}' with model '{model}' "
+                    f"(attempt {attempt}/{self.max_retries}): {exc.code}\n{detail}"
+                )
+            except urllib.error.URLError as exc:
+                last_error = (
+                    f"Ollama connection error for role '{role}' with model '{model}' "
+                    f"(attempt {attempt}/{self.max_retries}): {exc}"
+                )
+            except Exception as exc:
+                last_error = (
+                    f"Unexpected Ollama API failure for role '{role}' with model '{model}' "
+                    f"(attempt {attempt}/{self.max_retries}): {exc}"
+                )
+
+            if attempt < self.max_retries:
+                time.sleep(self.base_backoff_sec * (2 ** (attempt - 1)))
+
+        raise RuntimeError(last_error or f"Unknown Ollama API failure for role '{role}'")

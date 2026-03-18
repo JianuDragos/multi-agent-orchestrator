@@ -1,0 +1,274 @@
+import json
+from pathlib import Path
+from tools.ollama_client import OllamaClient
+from tools.project_scan import build_project_tree, collect_relevant_files, read_file_safe
+
+
+IGNORED_DIRS = {".git", ".venv", "__pycache__", "node_modules", "runs", "memory"}
+
+
+def extract_json(text: str) -> str:
+    import json
+
+    text = text.strip()
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    decoder = json.JSONDecoder()
+
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, end = decoder.raw_decode(text[i:])
+            return json.dumps(obj, ensure_ascii=False)
+        except json.JSONDecodeError:
+            continue
+
+    return text
+
+def keyword_guess(task: str):
+    words = []
+    raw = task.lower().replace("-", " ").replace("/", " ").split()
+
+    for w in raw:
+        w = w.strip(".,:;!?()[]{}\"'")
+        if len(w) >= 3:
+            words.append(w)
+
+    extra = []
+    lowered = task.lower()
+
+    if "cart" in lowered:
+        extra += ["cart", "base", "main", "routes", "template"]
+    if "button" in lowered:
+        extra += ["js", "html", "template"]
+    if "quantity" in lowered or "decrease" in lowered or "minus" in lowered:
+        extra += ["quantity", "decrease", "cart", "main"]
+
+    return list(dict.fromkeys(words + extra))
+
+
+def list_all_project_files(root: Path):
+    files = []
+    for path in root.rglob("*"):
+        if path.is_file():
+            if any(part in IGNORED_DIRS for part in path.parts):
+                continue
+            files.append(str(path.relative_to(root)))
+    return sorted(files)
+
+
+def validate_plan(plan: dict, real_files: list[str], task: str):
+    problems = []
+    task_lower = task.lower()
+
+    files_to_modify = plan.get("files_to_modify", [])
+    files_to_avoid = plan.get("files_to_avoid", [])
+    steps = plan.get("steps", [])
+    probable_cause = str(plan.get("probable_cause", "")).lower()
+
+    for f in files_to_modify:
+        if f not in real_files:
+            problems.append(f"files_to_modify contains non-existent path: {f}")
+
+    for f in files_to_avoid:
+        if f not in real_files:
+            problems.append(f"files_to_avoid contains non-existent path: {f}")
+
+    combined = " ".join(steps).lower() + " " + probable_cause
+    modify_joined = " ".join(files_to_modify).lower()
+
+    if "cart" in task_lower and "cart" not in modify_joined:
+        problems.append("task mentions cart, but files_to_modify do not point to cart-related files")
+
+    if "decrease" in task_lower or "minus" in task_lower:
+        if "decrease" not in combined and "minus" not in combined and "quantity" not in combined:
+            problems.append("task mentions decrease/minus, but plan does not clearly address it")
+
+    if "plus button" in task_lower and "plus" not in combined:
+        problems.append("task mentions preserving plus button, but plan does not mention this constraint")
+
+    if "navbar" in task_lower and "navbar" not in combined and "base" not in modify_joined:
+        problems.append("task mentions navbar cart count, but plan does not consider navbar/base template implications")
+
+    if "clear cart" in combined and "clear cart" not in task_lower:
+        problems.append("plan drifted to clear-cart behavior which is off-task")
+
+    if "catalog" in modify_joined and "cart" in task_lower:
+        problems.append("plan targets catalog instead of cart-related files")
+
+    return problems
+
+
+def main():
+    client = OllamaClient()
+
+    print("=== Multi-Agent Orchestrator ===")
+    project_path = input("Enter project path: ").strip()
+    task = input("Enter task: ").strip()
+
+    if not project_path:
+        print("No project path provided.")
+        return
+
+    if not task:
+        print("No task provided.")
+        return
+
+    root = Path(project_path).resolve()
+    if not root.exists():
+        print(f"Project path does not exist: {root}")
+        return
+
+    print("\n[Context] Building project tree...")
+    tree = build_project_tree(str(root))
+    real_files = list_all_project_files(root)
+
+    keywords = keyword_guess(task)
+    relevant_files = collect_relevant_files(str(root), keywords=keywords, max_files=8)
+
+    print("\n=== Relevant files selected ===")
+    for f in relevant_files:
+        print("-", f.relative_to(root))
+
+    file_blocks = []
+    for path in relevant_files:
+        rel = path.relative_to(root)
+        content = read_file_safe(path)
+        file_blocks.append(f"=== FILE: {rel} ===\n{content}")
+
+    relevant_context = "\n\n".join(file_blocks)
+    real_files_text = "\n".join(real_files)
+    relevant_file_names = [str(f.relative_to(root)) for f in relevant_files]
+
+    coordinator_prompt = f"""
+You are the coordinator in a multi-agent coding system.
+
+Project root:
+{root}
+
+Task:
+{task}
+
+Project tree:
+{tree}
+
+All real project files:
+{real_files_text}
+
+Relevant files:
+{relevant_context}
+
+Return ONLY valid JSON with this exact schema:
+{{
+  "task_type": "code or ui or mixed",
+  "probable_cause": "short text",
+  "files_to_modify": ["real/project/file1", "real/project/file2"],
+  "files_to_avoid": ["real/project/file3"],
+  "steps": ["step1", "step2", "step3"],
+  "risks": ["risk1", "risk2"]
+}}
+
+Rules:
+- Use ONLY real file paths that exist in 'All real project files'.
+- Do not invent filenames.
+- Stay strictly on the requested task.
+- If the task mentions decrease button, do not switch to clear cart or unrelated features.
+""".strip()
+
+    print("\n[1/2] Asking coordinator...")
+    coordinator_raw = client.generate("coordinator", coordinator_prompt)
+
+    print("\n=== Coordinator raw response ===")
+    print(coordinator_raw)
+
+    coordinator_clean = extract_json(coordinator_raw)
+
+    print("\n=== Coordinator cleaned response ===")
+    print(coordinator_clean)
+
+    try:
+        coordinator_plan = json.loads(coordinator_clean)
+    except json.JSONDecodeError as e:
+        print("\nCoordinator did not return valid JSON.")
+        print(f"JSON error: {e}")
+        return
+
+    print("\n=== Coordinator parsed JSON ===")
+    print(json.dumps(coordinator_plan, indent=2, ensure_ascii=False))
+
+    validation_problems = validate_plan(coordinator_plan, real_files, task)
+
+    print("\n=== Local validation ===")
+    if validation_problems:
+        for p in validation_problems:
+            print("-", p)
+    else:
+        print("No local validation problems detected.")
+
+    supervisor_prompt = f"""
+You are the supervisor in a multi-agent coding system.
+
+Task:
+{task}
+
+Relevant real files:
+{json.dumps(relevant_file_names, ensure_ascii=False)}
+
+Coordinator plan:
+{json.dumps(coordinator_plan, ensure_ascii=False)}
+
+Local validation problems:
+{json.dumps(validation_problems, ensure_ascii=False)}
+
+Return ONLY valid JSON with this exact schema:
+{{
+  "approved": true,
+  "worker": "code or ui",
+  "reason": "short text",
+  "files_to_modify": ["real/project/file1", "real/project/file2"],
+  "files_to_avoid": ["real/project/file3"],
+  "constraints": ["constraint1", "constraint2"],
+  "corrected_steps": ["step1", "step2", "step3"]
+}}
+
+Rules:
+- Use ONLY file paths from this list: {json.dumps(relevant_file_names, ensure_ascii=False)}
+- Reject off-task plans.
+- If the task is about cart decrease button, do not propose catalog or clear-cart features.
+- Prefer minimal safe changes.
+- Preserve existing plus button behavior.
+- Preserve navbar cart count behavior.
+""".strip()
+
+    print("\n[2/2] Asking supervisor...")
+    supervisor_raw = client.generate("supervisor", supervisor_prompt)
+
+    print("\n=== Supervisor raw response ===")
+    print(supervisor_raw)
+
+    supervisor_clean = extract_json(supervisor_raw)
+
+    print("\n=== Supervisor cleaned response ===")
+    print(supervisor_clean)
+
+    try:
+        supervisor_plan = json.loads(supervisor_clean)
+    except json.JSONDecodeError as e:
+        print("\nSupervisor did not return valid JSON.")
+        print(f"JSON error: {e}")
+        return
+
+    print("\n=== Supervisor parsed JSON ===")
+    print(json.dumps(supervisor_plan, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

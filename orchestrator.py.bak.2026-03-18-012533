@@ -1,0 +1,336 @@
+import json
+from pathlib import Path
+
+from tools.ollama_client import OllamaClient
+from tools.project_scan import build_project_tree, collect_relevant_files, read_file_safe
+from tools.json_utils import extract_json_candidates
+from tools.plan_validation import (
+    normalize_list,
+    normalize_plan_paths,
+    validate_coordinator_plan,
+    validate_supervisor_plan,
+)
+
+
+IGNORED_DIRS = {".git", ".venv", "__pycache__", "node_modules", "runs", "memory"}
+
+
+def keyword_guess(task: str):
+    words = []
+    raw = task.lower().replace("-", " ").replace("/", " ").split()
+
+    for w in raw:
+        w = w.strip(".,:;!?()[]{}\"'")
+        if len(w) >= 3:
+            words.append(w)
+
+    extra = []
+    lowered = task.lower()
+
+    if "ui" in lowered or "frontend" in lowered or "button" in lowered:
+        extra += ["html", "js", "css", "template"]
+    if "api" in lowered or "backend" in lowered or "route" in lowered:
+        extra += ["py", "routes", "api", "server"]
+    if "database" in lowered or "db" in lowered:
+        extra += ["db", "database", "models", "sql"]
+
+    return list(dict.fromkeys(words + extra))
+
+
+def list_all_project_files(root: Path):
+    files = []
+    for path in root.rglob("*"):
+        if path.is_file():
+            if any(part in IGNORED_DIRS for part in path.parts):
+                continue
+            files.append(str(path.relative_to(root)).replace("\\", "/"))
+    return sorted(files)
+
+
+def select_best_candidate(raw_text, expected_keys, validator, real_files, label):
+    candidates = extract_json_candidates(raw_text)
+    ranked = []
+
+    for entry in candidates:
+        obj = normalize_plan_paths(entry["object"])
+        present_key_count = sum(1 for key in expected_keys if key in obj)
+        validation_problems = validator(obj, real_files)
+
+        score = (
+            len(validation_problems),
+            -present_key_count,
+            -len(obj),
+            -entry["index"],
+        )
+
+        ranked.append({
+            "score": score,
+            "object": obj,
+            "problems": validation_problems,
+            "index": entry["index"],
+        })
+
+    ranked.sort(key=lambda item: item["score"])
+    best = ranked[0]
+
+    print(f"\n=== {label} candidate selection ===")
+    print(f"Found {len(ranked)} JSON candidate(s)")
+    print(f"Selected candidate index: {best['index']}")
+    print(f"Selected candidate validation problem count: {len(best['problems'])}")
+
+    return best["object"]
+
+
+def main():
+    client = OllamaClient()
+
+    print("=== Multi-Agent Orchestrator ===")
+    project_path = input("Enter project path: ").strip()
+    task = input("Enter task: ").strip()
+
+    if not project_path:
+        print("No project path provided.")
+        return
+
+    if not task:
+        print("No task provided.")
+        return
+
+    root = Path(project_path).resolve()
+    if not root.exists():
+        print(f"Project path does not exist: {root}")
+        return
+
+    print("\n[Context] Building project tree...")
+    tree = build_project_tree(str(root))
+    real_files = list_all_project_files(root)
+
+    keywords = keyword_guess(task)
+    relevant_files = collect_relevant_files(str(root), keywords=keywords, max_files=8)
+
+    print("\n=== Relevant files selected ===")
+    for f in relevant_files:
+        print("-", f.relative_to(root))
+
+    file_blocks = []
+    for path in relevant_files:
+        rel = path.relative_to(root)
+        content = read_file_safe(path)
+        file_blocks.append(f"=== FILE: {rel} ===\n{content}")
+
+    relevant_context = "\n\n".join(file_blocks)
+    real_files_text = "\n".join(real_files)
+
+    coordinator_prompt = f"""
+You are the coordinator in a multi-agent coding system.
+
+Your job is to produce a narrow, grounded implementation plan for exactly the user's task.
+
+Project root:
+{root}
+
+Task:
+{task}
+
+Project tree:
+{tree}
+
+All real project files:
+{real_files_text}
+
+Relevant file contents:
+{relevant_context}
+
+Return ONLY one valid JSON object with this exact schema:
+{{
+  "task_type": "code or ui or mixed",
+  "probable_cause": "short text",
+  "files_to_modify": ["real/project/file1", "real/project/file2"],
+  "files_to_avoid": ["real/project/file3"],
+  "steps": ["step1", "step2", "step3"],
+  "risks": ["risk1", "risk2"]
+}}
+
+Rules:
+- Use ONLY real file paths from "All real project files".
+- Do not invent filenames.
+- Stay strictly on the requested task.
+- Do not propose unrelated enhancements.
+- Do not propose optional UX improvements, animations, notifications, refactors, cleanup, or extra features unless the task explicitly asks for them.
+- Prefer the smallest safe change set.
+- STRICT LIMIT: Maximum 3 files_to_modify unless absolutely necessary.
+- If you need more than 3 files, you MUST justify it in "risks".
+- Return 2 to 5 concrete steps, not a long roadmap.
+- Every schema field is required.
+- files_to_avoid may be [] if nothing should be avoided.
+""".strip()
+
+    print("\n[1/2] Asking coordinator...")
+    coordinator_raw = client.generate("coordinator", coordinator_prompt)
+
+    print("\n=== Coordinator raw response ===")
+    print(coordinator_raw)
+
+    try:
+        coordinator_plan = select_best_candidate(
+            raw_text=coordinator_raw,
+            expected_keys=[
+                "task_type",
+                "probable_cause",
+                "files_to_modify",
+                "files_to_avoid",
+                "steps",
+                "risks",
+            ],
+            validator=validate_coordinator_plan,
+            real_files=real_files,
+            label="Coordinator",
+        )
+    except ValueError as e:
+        print("\nCoordinator output could not be parsed into JSON candidates.")
+        print(e)
+        return
+
+    print("\n=== Coordinator parsed JSON ===")
+    print(json.dumps(coordinator_plan, indent=2, ensure_ascii=False))
+
+    coordinator_validation_problems = validate_coordinator_plan(coordinator_plan, real_files)
+
+    print("\n=== Coordinator validation ===")
+    if coordinator_validation_problems:
+        for p in coordinator_validation_problems:
+            print("-", p)
+    else:
+        print("No coordinator validation problems detected.")
+
+    supervisor_prompt = f"""
+You are the supervisor in a multi-agent coding system.
+
+Your job is to review the coordinator plan, correct it if needed, and return exactly one JSON object.
+
+Task:
+{task}
+
+All real project files:
+{json.dumps(real_files, ensure_ascii=False)}
+
+Coordinator plan:
+{json.dumps(coordinator_plan, ensure_ascii=False)}
+
+Coordinator validation problems:
+{json.dumps(coordinator_validation_problems, ensure_ascii=False)}
+
+Return exactly one valid JSON object with this exact schema:
+{{
+  "approved": true,
+  "worker": "code or ui",
+  "reason": "short text",
+  "files_to_modify": ["real/project/file1", "real/project/file2"],
+  "files_to_avoid": ["real/project/file3"],
+  "constraints": ["constraint1", "constraint2"],
+  "corrected_steps": ["step1", "step2", "step3"]
+}}
+
+Hard rules:
+- Output JSON only.
+- Do not output markdown.
+- Do not use code fences.
+- Do not output explanations.
+- Do not output analysis.
+- Do not output thinking.
+- Do not write any text before the opening {{.
+- Do not write any text after the closing }}.
+- The response must start with {{ and end with }}.
+- Use ONLY file paths from "All real project files".
+- Prefer minimal safe changes.
+- Reject invented paths.
+- Reject unnecessarily broad changes.
+- Do not add unrelated enhancements or adjacent features.
+- STRICT LIMIT: Maximum 3 files_to_modify unless absolutely necessary.
+- If more than 3 files are truly required, explain why in "reason".
+- Every schema field is required.
+- Always include "constraints"; use [] if there are no constraints.
+- "approved" means whether your FINAL supervisor plan is safe to execute.
+- If you corrected the coordinator plan and your corrected plan is safe, set "approved" to true.
+- Set "approved" to false only if execution should stop and a new planning pass is required.
+""".strip()
+
+    print("\n[2/2] Asking supervisor...")
+    supervisor_raw = client.generate("supervisor", supervisor_prompt)
+
+    print("\n=== Supervisor raw response ===")
+    print(supervisor_raw)
+
+    try:
+        supervisor_plan = select_best_candidate(
+            raw_text=supervisor_raw,
+            expected_keys=[
+                "approved",
+                "worker",
+                "reason",
+                "files_to_modify",
+                "files_to_avoid",
+                "constraints",
+                "corrected_steps",
+            ],
+            validator=validate_supervisor_plan,
+            real_files=real_files,
+            label="Supervisor",
+        )
+    except ValueError as e:
+        print("\nSupervisor output could not be parsed into JSON candidates.")
+        print(e)
+        return
+
+    print("\n=== Supervisor parsed JSON ===")
+    print(json.dumps(supervisor_plan, indent=2, ensure_ascii=False))
+
+    supervisor_validation_problems = validate_supervisor_plan(supervisor_plan, real_files)
+
+    print("\n=== Supervisor validation ===")
+    if supervisor_validation_problems:
+        for p in supervisor_validation_problems:
+            print("-", p)
+        print("Stopping before worker routing.")
+        return
+    else:
+        print("No supervisor validation problems detected.")
+
+    approved = bool(supervisor_plan.get("approved", False))
+    if not approved:
+        print("\nSupervisor did not approve a final executable plan.")
+        print("Stopping before worker routing.")
+        return
+
+    constraints = normalize_list(supervisor_plan.get("constraints", []))
+    worker_type = str(supervisor_plan.get("worker", "")).strip().lower()
+
+    if worker_type == "code":
+        selected_worker_role = "code_worker"
+    elif worker_type == "ui":
+        selected_worker_role = "ui_worker"
+    else:
+        print("\nUnknown worker type returned by supervisor.")
+        print(f"worker={worker_type!r}")
+        return
+
+    worker_request = {
+        "task": task,
+        "worker": worker_type,
+        "selected_worker_role": selected_worker_role,
+        "files_to_modify": normalize_list(supervisor_plan.get("files_to_modify", [])),
+        "files_to_avoid": normalize_list(supervisor_plan.get("files_to_avoid", [])),
+        "constraints": constraints,
+        "steps": normalize_list(supervisor_plan.get("corrected_steps", [])),
+    }
+
+    print("\n=== Worker routing ===")
+    print(f"Selected worker type: {worker_type}")
+    print(f"Selected worker role: {selected_worker_role}")
+
+    print("\n=== Worker request preview ===")
+    print(json.dumps(worker_request, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

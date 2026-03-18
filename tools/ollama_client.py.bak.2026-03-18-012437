@@ -1,0 +1,29 @@
+import json
+import subprocess
+from pathlib import Path
+
+
+class OllamaClient:
+    def __init__(self, config_path: str = "config.json"):
+        self.config_path = Path(config_path)
+        self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
+
+    def get_model(self, role: str) -> str:
+        return self.config["models"][role]
+
+    def generate(self, role: str, prompt: str) -> str:
+        model = self.get_model(role)
+
+        result = subprocess.run(
+            ["ollama", "run", model, prompt],
+            capture_output=True,
+            text=True,
+            encoding="utf-8"
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Ollama error for role '{role}' with model '{model}':\n{result.stderr}"
+            )
+
+        return result.stdout.strip()

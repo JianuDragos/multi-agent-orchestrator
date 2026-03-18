@@ -1,0 +1,22 @@
+{
+  "models": {
+    "coordinator": "qwen3.5:35b-a3b",
+    "supervisor": "qwen3.5:35b-a3b",
+    "code_worker": "qwen3-coder:30b",
+    "ui_worker": "glm4.7-flash:latest"
+  },
+  "paths": {
+    "runs_dir": "runs",
+    "memory_dir": "memory"
+  },
+  "limits": {
+    "max_file_chars": 12000,
+    "max_context_files": 8,
+    "max_total_context_chars": 40000
+  },
+  "ollama": {
+    "timeout_sec": 60,
+    "max_retries": 1,
+    "base_backoff_sec": 1
+  }
+}

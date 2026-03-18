@@ -1,0 +1,12 @@
+# Medii virtuale Python
+.venv/
+venv/
+env/
+
+# Cache și fișiere compilate Python
+__pycache__/
+*.pyc
+
+# Directoare create de orchestratorul tău
+runs/
+memory/
