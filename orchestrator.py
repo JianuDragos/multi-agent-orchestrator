@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 from tools.ollama_client import OllamaClient
@@ -24,30 +25,209 @@ def task_keywords(task: str):
     return seen[:12]
 
 
+RETRIEVAL_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "into", "onto",
+    "when", "then", "than", "your", "their", "there", "have", "has", "had",
+    "will", "would", "should", "could", "without", "within", "about", "after",
+    "before", "where", "which", "while", "must", "need", "needs", "only",
+    "just", "make", "does", "page", "file", "files", "task", "project",
+    "fix", "update", "change"
+}
+
+
 def keyword_guess(task: str):
-    words = []
-    raw = task.lower().replace("-", " ").replace("/", " ").split()
+    tokens = []
+    raw = re.findall(r"[a-zA-Z_][a-zA-Z0-9_\-]{2,}", task.lower())
 
-    for w in raw:
-        w = w.strip(".,:;!?()[]{}\"'")
-        if len(w) >= 3:
-            words.append(w)
+    for tok in raw:
+        tok = tok.strip("._-")
+        if len(tok) >= 3 and tok not in RETRIEVAL_STOPWORDS:
+            tokens.append(tok)
 
-    extra = []
-    lowered = task.lower()
+    bigrams = []
+    for i in range(len(tokens) - 1):
+        bigrams.append(f"{tokens[i]}_{tokens[i+1]}")
 
-    if "cart" in lowered:
-        extra += ["cart", "quantity", "update", "routes", "route"]
-    if "decrease" in lowered or "minus" in lowered:
-        extra += ["decrease", "quantity", "action", "update"]
-    if "plus" in lowered or "increase" in lowered:
-        extra += ["plus", "increase", "quantity"]
-    if "navbar" in lowered:
-        extra += ["base", "cart_count", "navbar"]
-    if "button" in lowered:
-        extra += ["cart", "quantity", "form"]
+    return list(dict.fromkeys(tokens + bigrams))[:18]
 
-    return list(dict.fromkeys(words + extra))
+
+def get_keywords_agentic(client, task: str, tree: str):
+    fallback = keyword_guess(task)
+
+    prompt = f"""
+You are a retrieval helper.
+Generate search keywords for finding relevant files in a codebase.
+
+Return exactly one JSON object with this schema:
+{{
+  "keywords": ["kw1", "kw2", "kw3"]
+}}
+
+Rules:
+- Output JSON only.
+- Do not output markdown.
+- Do not explain.
+- Prefer short file-search terms.
+- Include domain terms from the task.
+- Include likely code terms from the tree when relevant.
+- Return 8 to 15 keywords.
+- Do not invent technologies not suggested by the task or tree.
+
+TASK:
+{task}
+
+PROJECT TREE:
+{tree}
+""".strip()
+
+    try:
+        raw = client.generate("retriever", prompt)
+        candidates = extract_json_candidates(raw)
+
+        for entry in reversed(candidates):
+            obj = entry.get("object", {})
+            kws = obj.get("keywords", [])
+            kws = normalize_list(kws)
+            kws = [
+                str(x).strip().lower()
+                for x in kws
+                if str(x).strip() and len(str(x).strip()) >= 3
+            ]
+            if kws:
+                return list(dict.fromkeys(kws))[:18]
+    except Exception as exc:
+        print(f"[retrieval keyword fallback] {type(exc).__name__}: {exc}")
+
+    return fallback
+
+
+STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "into", "onto",
+    "when", "then", "than", "your", "their", "there", "have", "has", "had",
+    "will", "would", "should", "could", "without", "within", "about", "after",
+    "before", "where", "which", "while", "must", "need", "needs", "only",
+    "just", "make", "does", "page", "file", "files", "task"
+}
+
+
+def _tokenize_text(text: str):
+    return [
+        t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", str(text).lower())
+        if t not in STOPWORDS and len(t) >= 3
+    ]
+
+
+def _tokenize_path(path: str):
+    return [
+        t for t in re.split(r"[/_.\-]+", str(path).lower())
+        if t and t not in STOPWORDS and len(t) >= 3
+    ]
+
+
+def _flatten_plan_text(value):
+    out = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            for item in v.values():
+                walk(item)
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+        elif isinstance(v, str):
+            out.append(v)
+
+    walk(value)
+    return "\n".join(out)
+
+
+def _task_alignment_problems(plan, task):
+    if not isinstance(plan, dict):
+        return []
+
+    task_tokens = set(_tokenize_text(task))
+    if not task_tokens:
+        return []
+
+    plan_text = _flatten_plan_text(plan)
+    plan_tokens = set(_tokenize_text(plan_text))
+    overlap = task_tokens.intersection(plan_tokens)
+
+    if not overlap:
+        return ["plan appears off-task: no meaningful task keywords appear in the plan"]
+
+    return []
+
+
+def context_relevance_problems(plan: dict, task: str, used_context_files: list[str]):
+    if not isinstance(plan, dict):
+        return []
+
+    task_tokens = set(_tokenize_text(task))
+    if not task_tokens:
+        return []
+
+    files_to_modify = {str(x).strip() for x in normalize_list(plan.get("files_to_modify", []))}
+    files_to_avoid = {str(x).strip() for x in normalize_list(plan.get("files_to_avoid", []))}
+    evidence_files = set()
+
+    evidence = plan.get("evidence", [])
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                f = str(item.get("file", "")).strip()
+                if f:
+                    evidence_files.add(f)
+
+    addressed = files_to_modify | files_to_avoid | evidence_files
+    problems = []
+
+    for path in used_context_files:
+        overlap = task_tokens.intersection(_tokenize_path(path))
+        if overlap and path not in addressed:
+            problems.append(f"used context file appears relevant but is not addressed: {path}")
+
+    return problems
+
+
+def unsupported_novelty_problems(plan: dict, task: str, used_context_files: list[str], relevant_context: str):
+    if not isinstance(plan, dict):
+        return []
+
+    allowed_tokens = set(_tokenize_text(task))
+    allowed_tokens.update(_tokenize_text(" ".join(used_context_files)))
+    allowed_tokens.update(_tokenize_text(relevant_context))
+
+    # also allow tokens that come from plan file paths themselves
+    for f in normalize_list(plan.get("files_to_modify", [])):
+        allowed_tokens.update(_tokenize_path(f))
+
+    for f in normalize_list(plan.get("files_to_avoid", [])):
+        allowed_tokens.update(_tokenize_path(f))
+
+    evidence = plan.get("evidence", [])
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                f = str(item.get("file", "")).strip()
+                if f:
+                    allowed_tokens.update(_tokenize_path(f))
+
+    plan_tokens = _tokenize_text(_flatten_plan_text(plan))
+    counts = {}
+
+    for tok in plan_tokens:
+        if tok not in allowed_tokens:
+            counts[tok] = counts.get(tok, 0) + 1
+
+    suspicious = sorted(
+        [tok for tok, count in counts.items() if count >= 2 and len(tok) >= 4]
+    )[:6]
+
+    if suspicious:
+        return [f"plan introduces unsupported terms not grounded in task/context: {', '.join(suspicious)}"]
+
+    return []
 
 
 def list_all_project_files(root: Path):
@@ -80,11 +260,37 @@ def validate_worker_plan(plan, allowed_files, task=None):
     if not files_to_modify:
         problems.append("files_to_modify is missing or empty")
 
+    evidence = plan.get("evidence", [])
+    if not isinstance(evidence, list) or not evidence:
+        problems.append("evidence is missing or empty")
+
     allowed = set(allowed_files)
     for f in files_to_modify:
         if f not in allowed:
             problems.append(f"Worker files_to_modify contains non-approved path: {f}")
 
+    evidence_files = []
+    if isinstance(evidence, list):
+        for item in evidence:
+            if not isinstance(item, dict):
+                problems.append("evidence contains a non-object item")
+                continue
+            f = str(item.get("file", "")).strip()
+            reason = str(item.get("reason", "")).strip()
+            if not f:
+                problems.append("evidence item is missing file")
+                continue
+            if not reason:
+                problems.append(f"evidence item is missing reason for file: {f}")
+            if f not in allowed:
+                problems.append(f"Worker evidence contains non-approved path: {f}")
+            evidence_files.append(f)
+
+    for f in files_to_modify:
+        if f not in evidence_files:
+            problems.append(f"files_to_modify missing matching evidence: {f}")
+
+    problems.extend(_task_alignment_problems(plan, task))
     return problems
 
 
@@ -284,188 +490,8 @@ def run_json_stage(client, role, prompt, expected_keys, validator, validation_co
     return raw, plan, problems
 
 
-def main():
-    client = OllamaClient()
-    config = json.loads(Path("config.json").read_text(encoding="utf-8"))
-    limits = config.get("limits", {})
-    paths_cfg = config.get("paths", {})
-
-    max_file_chars = int(limits.get("max_file_chars", 12000))
-    max_context_files = int(limits.get("max_context_files", 4))
-    max_total_context_chars = int(limits.get("max_total_context_chars", 40000))
-
-    runs_dir = Path(paths_cfg.get("runs_dir", "runs"))
-    runs_dir.mkdir(parents=True, exist_ok=True)
-
-    print("=== Multi-Agent Orchestrator ===")
-    project_path = input("Enter project path: ").strip()
-    task = input("Enter task: ").strip()
-
-    if not project_path:
-        print("No project path provided.")
-        return
-
-    if not task:
-        print("No task provided.")
-        return
-
-    root = Path(project_path).resolve()
-    if not root.exists():
-        print(f"Project path does not exist: {root}")
-        return
-
-    print("\n[Context] Building project tree...")
-    tree = build_project_tree(str(root))
-    real_files = list_all_project_files(root)
-
-    keywords = keyword_guess(task)
-    task_kw = task_keywords(task)
-    relevant_files = collect_relevant_files(str(root), keywords=keywords, max_files=max_context_files)
-
-    print("\n=== Relevant files selected ===")
-    for f in relevant_files:
-        print("-", f.relative_to(root))
-
-    relevant_context, used_context_files, total_context_chars = build_relevant_context(
-        relevant_files=relevant_files,
-        root=root,
-        max_file_chars=max_file_chars,
-        max_total_context_chars=max_total_context_chars,
-    )
-
-    print("\n=== Context budget ===")
-    print(f"Used files in context: {len(used_context_files)}")
-    print(f"Total context chars: {total_context_chars}")
-    print(f"Max total context chars: {max_total_context_chars}")
-
-    real_files_text = "\n".join(real_files)
-
-    coordinator_prompt_base = f"""
-You are a specialized JSON generator acting as the coordinator in a multi-agent coding system.
-You are NOT a chat assistant.
-Do not use chain-of-thought.
-Do not write "Thinking..." or explanations.
-Start your response with {{ and end with }}.
-
-Your job is to produce a narrow, grounded implementation plan for exactly the user's task.
-
-Project root:
-{root}
-
-PRIMARY TASK TO SOLVE:
-{task}
-
-TASK KEYWORDS:
-{json.dumps(task_kw, ensure_ascii=False)}
-
-You must solve the PRIMARY TASK above exactly as written.
-
-Project tree:
-{tree}
-
-All real project files:
-{real_files_text}
-
-Relevant file contents:
-{relevant_context}
-
-CRITICAL REMINDER BEFORE YOU ANSWER:
-PRIMARY TASK: {task}
-KEYWORDS: {json.dumps(task_kw, ensure_ascii=False)}
-Output ONLY JSON. Do not write "Thinking..." or explanations.
-
-Return ONLY one valid JSON object with this exact schema:
-{{
-  "task_type": "code or ui or mixed",
-  "probable_cause": "short text",
-  "files_to_modify": ["real/project/file1", "real/project/file2"],
-  "files_to_avoid": ["real/project/file3"],
-  "evidence": [{{"file": "real/project/file1", "reason": "why this file is relevant"}}],
-  "steps": ["step1", "step2", "step3"],
-  "risks": ["risk1", "risk2"]
-}}
-
-Rules:
-- Use ONLY real file paths from "All real project files".
-- Do not invent filenames.
-- Stay strictly on the requested task.
-- If the task mentions visible UI elements or page behavior (button, form, input, navbar, modal, page, layout, template), consider both rendering files and behavior files.
-- If the task mentions paired or opposite actions (increase/decrease, open/close, show/hide, enable/disable), the plan must explicitly cover both actions.
-- Do not place likely rendering files (.html, .htm, .jinja, .j2, template files) in files_to_avoid unless evidence clearly shows they are irrelevant.
-- Do not propose unrelated enhancements.
-- Do not propose optional UX improvements, animations, notifications, refactors, cleanup, or extra features unless the task explicitly asks for them.
-- Do not include orchestration metadata or repository-management steps.
-- Prefer the smallest safe change set.
-- STRICT LIMIT: Maximum 3 files_to_modify unless absolutely necessary.
-- If you need more than 3 files, you MUST justify it in "risks".
-- Return 2 to 5 concrete steps, not a long roadmap.
-- Every schema field is required.
-- Every file in files_to_modify must be justified in evidence.
-- Every evidence item must use a real file path and a short reason.
-- files_to_avoid may be [] if nothing should be avoided.
-""".strip()
-
-    print("\n[1/3] Asking coordinator...")
-    _, coordinator_plan, coordinator_validation_problems = run_json_stage(
-        client=client,
-        role="coordinator",
-        prompt=coordinator_prompt_base,
-        expected_keys=[
-            "task_type",
-            "probable_cause",
-            "files_to_modify",
-            "files_to_avoid",
-            "steps",
-            "risks",
-        ],
-        validator=validate_coordinator_plan,
-        validation_context=real_files,
-        task=task,
-        label="Coordinator",
-    )
-
-    coordinator_validation_problems.extend(context_grounding_problems(coordinator_plan, used_context_files))
-    coordinator_validation_problems = list(dict.fromkeys(coordinator_validation_problems))
-
-    if coordinator_validation_problems:
-        coordinator_repair_prompt = coordinator_prompt_base + f"""
-
-Your previous coordinator attempt had validation problems:
-{json.dumps(coordinator_validation_problems, ensure_ascii=False)}
-
-Repair the plan.
-Return one corrected JSON object only.
-Do not repeat the same invalid paths or schema mistakes.
-""".strip()
-
-        print("\n[1/3] Coordinator repair pass...")
-        _, repaired_coordinator_plan, repaired_coordinator_problems = run_json_stage(
-            client=client,
-            role="coordinator",
-            prompt=coordinator_repair_prompt,
-            expected_keys=[
-                "task_type",
-                "probable_cause",
-                "files_to_modify",
-                "files_to_avoid",
-                "evidence",
-                "steps",
-                "risks",
-            ],
-            validator=validate_coordinator_plan,
-            validation_context=real_files,
-            task=task,
-            label="Coordinator repair",
-        )
-
-        repaired_coordinator_problems.extend(context_grounding_problems(repaired_coordinator_plan, used_context_files))
-        repaired_coordinator_problems = list(dict.fromkeys(repaired_coordinator_problems))
-
-        if len(repaired_coordinator_problems) <= len(coordinator_validation_problems):
-            coordinator_plan = repaired_coordinator_plan
-            coordinator_validation_problems = repaired_coordinator_problems
-
-    supervisor_prompt_base = f"""
+def build_supervisor_prompt(task, task_kw, real_files, coordinator_plan, coordinator_validation_problems, used_context_files_text):
+    return f"""
 You are a specialized JSON generator acting as a skeptical supervisor in a multi-agent coding system.
 You are NOT a chat assistant.
 Do not use chain-of-thought.
@@ -491,6 +517,9 @@ Coordinator plan:
 
 Coordinator validation problems:
 {json.dumps(coordinator_validation_problems, ensure_ascii=False)}
+
+Context files the coordinator had available:
+{used_context_files_text}
 
 CRITICAL REMINDER BEFORE YOU ANSWER:
 PRIMARY TASK: {task}
@@ -539,6 +568,214 @@ Hard rules:
 - Set "approved" to false only if execution should stop and a new planning pass is required.
 """.strip()
 
+
+def main():
+    client = OllamaClient()
+    config = json.loads(Path("config.json").read_text(encoding="utf-8"))
+    limits = config.get("limits", {})
+    paths_cfg = config.get("paths", {})
+
+    max_file_chars = int(limits.get("max_file_chars", 12000))
+    max_context_files = int(limits.get("max_context_files", 4))
+    max_total_context_chars = int(limits.get("max_total_context_chars", 40000))
+    strict_worker_context_grounding = bool(config.get("strict_worker_context_grounding", True))
+
+    runs_dir = Path(paths_cfg.get("runs_dir", "runs"))
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=== Multi-Agent Orchestrator ===")
+    project_path = input("Enter project path: ").strip()
+    task = input("Enter task: ").strip()
+
+    if not project_path:
+        print("No project path provided.")
+        return
+
+    if not task:
+        print("No task provided.")
+        return
+
+    root = Path(project_path).resolve()
+    if not root.exists():
+        print(f"Project path does not exist: {root}")
+        return
+
+    print("\n[Context] Building project tree...")
+    tree = build_project_tree(str(root))
+    real_files = list_all_project_files(root)
+
+    keywords = get_keywords_agentic(client, task, tree)
+    task_kw = task_keywords(task)
+
+    print("\n=== Retrieval keywords ===")
+    for kw in keywords:
+        print("-", kw)
+
+    relevant_files = collect_relevant_files(str(root), keywords=keywords, max_files=max_context_files)
+
+    print("\n=== Relevant files selected ===")
+    for f in relevant_files:
+        print("-", f.relative_to(root))
+
+    relevant_context, used_context_files, total_context_chars = build_relevant_context(
+        relevant_files=relevant_files,
+        root=root,
+        max_file_chars=max_file_chars,
+        max_total_context_chars=max_total_context_chars,
+    )
+
+    print("\n=== Context budget ===")
+    print(f"Used files in context: {len(used_context_files)}")
+    print(f"Total context chars: {total_context_chars}")
+    print(f"Max total context chars: {max_total_context_chars}")
+
+    real_files_text = "\n".join(real_files)
+    used_context_files_text = json.dumps(used_context_files, ensure_ascii=False)
+
+    coordinator_prompt_base = f"""
+You are a specialized JSON generator acting as the coordinator in a multi-agent coding system.
+You are NOT a chat assistant.
+Do not use chain-of-thought.
+Do not write "Thinking..." or explanations.
+Start your response with {{ and end with }}.
+
+Your job is to produce a narrow, grounded implementation plan for exactly the user's task.
+
+Project root:
+{root}
+
+PRIMARY TASK TO SOLVE:
+{task}
+
+TASK KEYWORDS:
+{json.dumps(task_kw, ensure_ascii=False)}
+
+You must solve the PRIMARY TASK above exactly as written.
+
+Project tree:
+{tree}
+
+All real project files:
+{real_files_text}
+
+Context files you were actually given:
+{used_context_files_text}
+
+Relevant file contents:
+{relevant_context}
+
+CRITICAL REMINDER BEFORE YOU ANSWER:
+PRIMARY TASK: {task}
+KEYWORDS: {json.dumps(task_kw, ensure_ascii=False)}
+Output ONLY JSON. Do not write "Thinking..." or explanations.
+
+Return ONLY one valid JSON object with this exact schema:
+{{
+  "task_type": "code or ui or mixed",
+  "probable_cause": "short text",
+  "files_to_modify": ["real/project/file1", "real/project/file2"],
+  "files_to_avoid": ["real/project/file3"],
+  "evidence": [{{"file": "real/project/file1", "reason": "why this file is relevant"}}],
+  "steps": ["step1", "step2", "step3"],
+  "risks": ["risk1", "risk2"]
+}}
+
+Rules:
+- Use ONLY real file paths from "All real project files".
+- Prefer files from "Context files you were actually given".
+- Do not invent filenames.
+- Stay strictly on the requested task.
+- If the task mentions visible UI elements or page behavior (button, form, input, navbar, modal, page, layout, template), consider both rendering files and behavior files.
+- If the task mentions paired or opposite actions (increase/decrease, open/close, show/hide, enable/disable), the plan must explicitly cover both actions.
+- Do not place likely rendering files (.html, .htm, .jinja, .j2, template files) in files_to_avoid unless evidence clearly shows they are irrelevant.
+- Do not propose unrelated enhancements.
+- Do not propose optional UX improvements, animations, notifications, refactors, cleanup, or extra features unless the task explicitly asks for them.
+- Do not include orchestration metadata or repository-management steps.
+- Prefer the smallest safe change set.
+- STRICT LIMIT: Maximum 3 files_to_modify unless absolutely necessary.
+- If you need more than 3 files, you MUST justify it in "risks".
+- Return 2 to 5 concrete steps, not a long roadmap.
+- Every schema field is required.
+- Every file in files_to_modify must be justified in evidence.
+- Every evidence item must use a real file path and a short reason.
+- files_to_avoid may be [] if nothing should be avoided.
+""".strip()
+
+    print("\n[1/3] Asking coordinator...")
+    _, coordinator_plan, coordinator_validation_problems = run_json_stage(
+        client=client,
+        role="coordinator",
+        prompt=coordinator_prompt_base,
+        expected_keys=[
+            "task_type",
+            "probable_cause",
+            "files_to_modify",
+            "files_to_avoid",
+            "evidence",
+            "steps",
+            "risks",
+        ],
+        validator=validate_coordinator_plan,
+        validation_context=real_files,
+        task=task,
+        label="Coordinator",
+    )
+
+    print_grounding_debug("Coordinator", coordinator_plan, used_context_files)
+
+    coordinator_validation_problems.extend(context_grounding_problems(coordinator_plan, used_context_files))
+    coordinator_validation_problems.extend(context_relevance_problems(coordinator_plan, task, used_context_files))
+    coordinator_validation_problems.extend(unsupported_novelty_problems(coordinator_plan, task, used_context_files, relevant_context))
+    coordinator_validation_problems = list(dict.fromkeys(coordinator_validation_problems))
+
+    if coordinator_validation_problems:
+        coordinator_repair_prompt = coordinator_prompt_base + f"""
+
+Your previous coordinator attempt had validation problems:
+{json.dumps(coordinator_validation_problems, ensure_ascii=False)}
+
+Repair the plan.
+Return one corrected JSON object only.
+Do not repeat the same invalid paths or schema mistakes.
+""".strip()
+
+        print("\n[1/3] Coordinator repair pass...")
+        _, repaired_coordinator_plan, repaired_coordinator_problems = run_json_stage(
+            client=client,
+            role="coordinator",
+            prompt=coordinator_repair_prompt,
+            expected_keys=[
+                "task_type",
+                "probable_cause",
+                "files_to_modify",
+                "files_to_avoid",
+                "evidence",
+                "steps",
+                "risks",
+            ],
+            validator=validate_coordinator_plan,
+            validation_context=real_files,
+            task=task,
+            label="Coordinator repair",
+        )
+
+        repaired_coordinator_problems.extend(context_grounding_problems(repaired_coordinator_plan, used_context_files))
+        repaired_coordinator_problems.extend(context_relevance_problems(repaired_coordinator_plan, task, used_context_files))
+        repaired_coordinator_problems.extend(unsupported_novelty_problems(repaired_coordinator_plan, task, used_context_files, relevant_context))
+        repaired_coordinator_problems = list(dict.fromkeys(repaired_coordinator_problems))
+
+        if len(repaired_coordinator_problems) <= len(coordinator_validation_problems):
+            coordinator_plan = repaired_coordinator_plan
+            coordinator_validation_problems = repaired_coordinator_problems
+    supervisor_prompt_base = build_supervisor_prompt(
+        task=task,
+        task_kw=task_kw,
+        real_files=real_files,
+        coordinator_plan=coordinator_plan,
+        coordinator_validation_problems=coordinator_validation_problems,
+        used_context_files_text=used_context_files_text,
+    )
+
     print("\n[2/3] Asking supervisor...")
     _, supervisor_plan, supervisor_validation_problems = run_json_stage(
         client=client,
@@ -550,6 +787,7 @@ Hard rules:
             "reason",
             "files_to_modify",
             "files_to_avoid",
+            "evidence",
             "constraints",
             "corrected_steps",
         ],
@@ -559,7 +797,11 @@ Hard rules:
         label="Supervisor",
     )
 
+    print_grounding_debug("Supervisor", supervisor_plan, used_context_files)
+
     supervisor_validation_problems.extend(context_grounding_problems(supervisor_plan, used_context_files))
+    supervisor_validation_problems.extend(context_relevance_problems(supervisor_plan, task, used_context_files))
+    supervisor_validation_problems.extend(unsupported_novelty_problems(supervisor_plan, task, used_context_files, relevant_context))
     supervisor_validation_problems = list(dict.fromkeys(supervisor_validation_problems))
 
     if supervisor_validation_problems:
@@ -595,6 +837,8 @@ Do not repeat the same invalid paths or schema mistakes.
         )
 
         repaired_supervisor_problems.extend(context_grounding_problems(repaired_supervisor_plan, used_context_files))
+        repaired_supervisor_problems.extend(context_relevance_problems(repaired_supervisor_plan, task, used_context_files))
+        repaired_supervisor_problems.extend(unsupported_novelty_problems(repaired_supervisor_plan, task, used_context_files, relevant_context))
         repaired_supervisor_problems = list(dict.fromkeys(repaired_supervisor_problems))
 
         if len(repaired_supervisor_problems) <= len(supervisor_validation_problems):
@@ -602,14 +846,104 @@ Do not repeat the same invalid paths or schema mistakes.
             supervisor_validation_problems = repaired_supervisor_problems
 
     if supervisor_validation_problems:
+        print("\n=== Final supervisor gating problems ===")
+        for p in supervisor_validation_problems:
+            print("-", p)
         print("Stopping before worker routing.")
         return
 
     approved = bool(supervisor_plan.get("approved", False))
     if not approved:
-        print("\nSupervisor did not approve a final executable plan.")
-        print("Stopping before worker routing.")
-        return
+        print("\n[2/3] Coordinator revision from supervisor feedback...")
+
+        coordinator_revision_prompt = coordinator_prompt_base + f"""
+
+Supervisor rejected the previous plan.
+
+Supervisor reason:
+{str(supervisor_plan.get("reason", "")).strip()}
+
+Supervisor corrected steps:
+{json.dumps(normalize_list(supervisor_plan.get("corrected_steps", [])), ensure_ascii=False)}
+
+Supervisor constraints:
+{json.dumps(normalize_list(supervisor_plan.get("constraints", [])), ensure_ascii=False)}
+
+Revise the coordinator plan so it addresses the supervisor rejection.
+Return one corrected JSON object only.
+Do not invent unsupported mechanisms or new architecture unless it is grounded in the provided context.
+""".strip()
+
+        _, revised_coordinator_plan, revised_coordinator_problems = run_json_stage(
+            client=client,
+            role="coordinator",
+            prompt=coordinator_revision_prompt,
+            expected_keys=[
+                "task_type",
+                "probable_cause",
+                "files_to_modify",
+                "files_to_avoid",
+                "evidence",
+                "steps",
+                "risks",
+            ],
+            validator=validate_coordinator_plan,
+            validation_context=real_files,
+            task=task,
+            label="Coordinator revision",
+        )
+
+        print_grounding_debug("Coordinator revision", revised_coordinator_plan, used_context_files)
+
+        revised_coordinator_problems.extend(context_grounding_problems(revised_coordinator_plan, used_context_files))
+        revised_coordinator_problems.extend(context_relevance_problems(revised_coordinator_plan, task, used_context_files))
+        revised_coordinator_problems.extend(unsupported_novelty_problems(revised_coordinator_plan, task, used_context_files, relevant_context))
+        revised_coordinator_problems = list(dict.fromkeys(revised_coordinator_problems))
+
+        coordinator_plan = revised_coordinator_plan
+        coordinator_validation_problems = revised_coordinator_problems
+
+        supervisor_prompt_base = build_supervisor_prompt(
+            task=task,
+            task_kw=task_kw,
+            real_files=real_files,
+            coordinator_plan=coordinator_plan,
+            coordinator_validation_problems=coordinator_validation_problems,
+            used_context_files_text=used_context_files_text,
+        )
+
+        print("\n[2/3] Supervisor re-review...")
+        _, supervisor_plan, supervisor_validation_problems = run_json_stage(
+            client=client,
+            role="supervisor",
+            prompt=supervisor_prompt_base,
+            expected_keys=[
+                "approved",
+                "worker",
+                "reason",
+                "files_to_modify",
+                "files_to_avoid",
+                "evidence",
+                "constraints",
+                "corrected_steps",
+            ],
+            validator=validate_supervisor_plan,
+            validation_context=real_files,
+            task=task,
+            label="Supervisor re-review",
+        )
+
+        print_grounding_debug("Supervisor re-review", supervisor_plan, used_context_files)
+
+        supervisor_validation_problems.extend(context_grounding_problems(supervisor_plan, used_context_files))
+        supervisor_validation_problems.extend(context_relevance_problems(supervisor_plan, task, used_context_files))
+        supervisor_validation_problems.extend(unsupported_novelty_problems(supervisor_plan, task, used_context_files, relevant_context))
+        supervisor_validation_problems = list(dict.fromkeys(supervisor_validation_problems))
+
+        approved = bool(supervisor_plan.get("approved", False))
+        if supervisor_validation_problems or not approved:
+            print("Stopping before worker routing.")
+            return
 
     constraints = normalize_list(supervisor_plan.get("constraints", []))
     worker_type = str(supervisor_plan.get("worker", "")).strip().lower()
@@ -624,15 +958,35 @@ Do not repeat the same invalid paths or schema mistakes.
         return
 
     approved_files = normalize_list(supervisor_plan.get("files_to_modify", []))
+    grounded_worker_files = [f for f in approved_files if f in used_context_files]
+    out_of_context_approved_files = [f for f in approved_files if f not in used_context_files]
+
+    if out_of_context_approved_files:
+        print("\n=== Worker grounding gate ===")
+        print("Approved files outside analyzed context:")
+        for f in out_of_context_approved_files:
+            print("-", f)
+
+        if strict_worker_context_grounding:
+            print("Stopping before worker routing because strict_worker_context_grounding is enabled.")
+            return
+
+    effective_worker_files = grounded_worker_files if strict_worker_context_grounding else approved_files
+
+    if not effective_worker_files:
+        print("\nNo grounded worker files available.")
+        print("Stopping before worker routing.")
+        return
 
     worker_request = {
         "task": task,
         "worker": worker_type,
         "selected_worker_role": selected_worker_role,
-        "files_to_modify": approved_files,
+        "files_to_modify": effective_worker_files,
         "files_to_avoid": normalize_list(supervisor_plan.get("files_to_avoid", [])),
         "constraints": constraints,
         "steps": normalize_list(supervisor_plan.get("corrected_steps", [])),
+        "evidence": supervisor_plan.get("evidence", []),
     }
 
     print("\n=== Worker routing ===")
@@ -641,6 +995,14 @@ Do not repeat the same invalid paths or schema mistakes.
 
     print("\n=== Worker request preview ===")
     print(json.dumps(worker_request, indent=2, ensure_ascii=False))
+
+    worker_context_blocks = []
+    for rel_path in effective_worker_files:
+        abs_path = root / rel_path
+        if abs_path.exists() and abs_path.is_file():
+            worker_content = read_file_safe(abs_path, max_chars=max_file_chars)
+            worker_context_blocks.append(f"=== FILE: {rel_path} ===\n{worker_content}\n")
+    worker_context = "\n".join(worker_context_blocks)
 
     worker_prompt_base = f"""
 You are a specialized JSON generator acting as the implementation worker in a multi-agent coding system.
@@ -662,6 +1024,9 @@ You must translate the approved plan for the PRIMARY TASK above exactly as writt
 Approved worker request:
 {json.dumps(worker_request, ensure_ascii=False)}
 
+Approved file contents for this worker only:
+{worker_context}
+
 CRITICAL REMINDER BEFORE YOU ANSWER:
 PRIMARY TASK: {task}
 KEYWORDS: {json.dumps(task_kw, ensure_ascii=False)}
@@ -671,6 +1036,7 @@ Return exactly one valid JSON object with this exact schema:
 {{
   "implementation_summary": "short text",
   "files_to_modify": ["real/project/file1", "real/project/file2"],
+  "evidence": [{{"file": "real/project/file1", "reason": "why this file is relevant"}}],
   "aider_task": "concise implementation instruction for Aider"
 }}
 
@@ -678,7 +1044,7 @@ Hard rules:
 - Output JSON only.
 - Do not output markdown.
 - Do not output analysis or thinking.
-- Use ONLY files from this approved list: {json.dumps(approved_files, ensure_ascii=False)}
+- Use ONLY files from this grounded approved list: {json.dumps(effective_worker_files, ensure_ascii=False)}
 - Do not add any new files.
 - Do not add unrelated improvements.
 - Do not mention orchestration, path normalization, repo management, or file path reference changes.
@@ -696,10 +1062,11 @@ Hard rules:
         expected_keys=[
             "implementation_summary",
             "files_to_modify",
+            "evidence",
             "aider_task",
         ],
         validator=validate_worker_plan,
-        validation_context=approved_files,
+        validation_context=effective_worker_files,
         task=task,
         label="Worker",
     )
@@ -723,10 +1090,11 @@ Do not add files outside the approved list.
             expected_keys=[
                 "implementation_summary",
                 "files_to_modify",
+                "evidence",
                 "aider_task",
             ],
             validator=validate_worker_plan,
-            validation_context=approved_files,
+            validation_context=effective_worker_files,
             task=task,
             label="Worker repair",
         )
@@ -754,6 +1122,9 @@ Do not add files outside the approved list.
         "supervisor_plan": supervisor_plan,
         "supervisor_validation_problems": supervisor_validation_problems,
         "worker_request": worker_request,
+        "approved_files": approved_files,
+        "grounded_worker_files": grounded_worker_files,
+        "out_of_context_approved_files": out_of_context_approved_files,
         "worker_plan": worker_plan,
         "worker_validation_problems": worker_validation_problems,
         "aider_task": aider_task,

@@ -3,7 +3,8 @@
     "coordinator": "qwen3.5:35b-a3b",
     "supervisor": "qwen3.5:35b-a3b",
     "code_worker": "qwen3-coder:30b",
-    "ui_worker": "glm4.7-flash:latest"
+    "ui_worker": "glm4.7-flash:latest",
+    "retriever": "qwen2.5:3b"
   },
   "paths": {
     "runs_dir": "runs",
