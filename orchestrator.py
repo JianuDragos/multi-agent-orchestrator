@@ -194,13 +194,14 @@ def context_relevance_problems(plan: dict, used_context_files: list[str], used_c
                     evidence_files.add(f)
 
     addressed = files_to_modify | files_to_avoid | evidence_files
+
     top_score = max(used_context_score_map.get(path, 0) for path in used_context_files)
     if top_score < 8:
         return []
 
     generic_basenames = {"app", "config", "database", "models", "index", "base", "main", "utils", "helpers"}
-    problems = []
 
+    strong_candidates = []
     for path in used_context_files:
         score = used_context_score_map.get(path, 0)
         matched_count = used_context_match_count_map.get(path, 0)
@@ -209,12 +210,18 @@ def context_relevance_problems(plan: dict, used_context_files: list[str], used_c
         if stem in generic_basenames:
             continue
 
-        # General rule:
-        # only flag ignored files that were retrieved strongly AND matched multiple distinct keywords
-        if score >= max(8, top_score - 2) and matched_count >= 2 and path not in addressed:
-            problems.append(f"high-priority multi-signal retrieved file not addressed: {path}")
+        if score >= max(8, top_score - 2) and matched_count >= 2:
+            strong_candidates.append(path)
 
-    return problems[:2]
+    if len(strong_candidates) <= 1:
+        return []
+
+    addressed_strong = [path for path in strong_candidates if path in addressed]
+    if addressed_strong:
+        return []
+
+    preview = ", ".join(strong_candidates[:3])
+    return [f"none of the strongest retrieved context files are addressed: {preview}"]
 
 
 TECH_NOVELTY_TERMS = {
@@ -322,7 +329,18 @@ def validate_worker_plan(plan, allowed_files, task=None):
 
 
 def select_best_candidate(raw_text, expected_keys, validator, validation_context, task, label):
-    candidates = extract_json_candidates(raw_text)
+    try:
+        candidates = extract_json_candidates(raw_text)
+    except Exception as exc:
+        print(f"\n=== {label} candidate selection ===")
+        print(f"JSON extraction failed: {type(exc).__name__}: {exc}")
+        return None, [f"{label} output did not contain a valid JSON object: {type(exc).__name__}: {exc}"]
+
+    if not candidates:
+        print(f"\n=== {label} candidate selection ===")
+        print("No JSON candidates found.")
+        return None, [f"{label} output did not contain any JSON candidate"]
+
     ranked = []
 
     for entry in candidates:
@@ -352,7 +370,7 @@ def select_best_candidate(raw_text, expected_keys, validator, validation_context
     print(f"Selected candidate index: {best['index']}")
     print(f"Selected candidate validation problem count: {len(best['problems'])}")
 
-    return best["object"]
+    return best["object"], list(best["problems"])
 
 
 def build_relevant_context(relevant_files, root: Path, max_file_chars: int, max_total_context_chars: int):
@@ -493,7 +511,7 @@ def run_json_stage(client, role, prompt, expected_keys, validator, validation_co
     print(f"\n=== {label} raw response (filtered) ===")
     print(format_raw_response_for_display(raw))
 
-    plan = select_best_candidate(
+    plan, selection_problems = select_best_candidate(
         raw_text=raw,
         expected_keys=expected_keys,
         validator=validator,
@@ -502,10 +520,15 @@ def run_json_stage(client, role, prompt, expected_keys, validator, validation_co
         label=label,
     )
 
+    if plan is None:
+        plan = {}
+
     print(f"\n=== {label} parsed JSON ===")
     print(json.dumps(plan, indent=2, ensure_ascii=False))
 
-    problems = validator(plan, validation_context, task)
+    problems = list(selection_problems)
+    problems.extend(validator(plan, validation_context, task))
+    problems = list(dict.fromkeys(problems))
 
     print(f"\n=== {label} validation ===")
     if problems:
@@ -517,7 +540,7 @@ def run_json_stage(client, role, prompt, expected_keys, validator, validation_co
     return raw, plan, problems
 
 
-def build_supervisor_prompt(task, task_kw, real_files, coordinator_plan, coordinator_validation_problems, used_context_files_text):
+def build_supervisor_prompt(task, task_kw, real_files, coordinator_plan, coordinator_validation_problems, used_context_files_text, relevant_context_text):
     return f"""
 You are a specialized JSON generator acting as a skeptical supervisor in a multi-agent coding system.
 You are NOT a chat assistant.
@@ -547,6 +570,9 @@ Coordinator validation problems:
 
 Context files the coordinator had available:
 {used_context_files_text}
+
+Relevant context content the coordinator saw:
+{relevant_context_text}
 
 CRITICAL REMINDER BEFORE YOU ANSWER:
 PRIMARY TASK: {task}
@@ -823,6 +849,7 @@ Do not repeat the same invalid paths or schema mistakes.
         coordinator_plan=coordinator_plan,
         coordinator_validation_problems=coordinator_validation_problems,
         used_context_files_text=used_context_files_text,
+        relevant_context_text=relevant_context,
     )
 
     print("\n[2/3] Asking supervisor...")
@@ -959,6 +986,7 @@ Do not invent unsupported mechanisms or new architecture unless it is grounded i
             coordinator_plan=coordinator_plan,
             coordinator_validation_problems=coordinator_validation_problems,
             used_context_files_text=used_context_files_text,
+            relevant_context_text=relevant_context,
         )
 
         print("\n[2/3] Supervisor re-review...")
@@ -1027,6 +1055,16 @@ Do not invent unsupported mechanisms or new architecture unless it is grounded i
         print("Stopping before worker routing.")
         return
 
+    filtered_worker_evidence = []
+    supervisor_evidence = supervisor_plan.get("evidence", [])
+    if isinstance(supervisor_evidence, list):
+        for item in supervisor_evidence:
+            if not isinstance(item, dict):
+                continue
+            evidence_file = str(item.get("file", "")).strip()
+            if evidence_file in effective_worker_files:
+                filtered_worker_evidence.append(item)
+
     worker_request = {
         "task": task,
         "worker": worker_type,
@@ -1035,7 +1073,7 @@ Do not invent unsupported mechanisms or new architecture unless it is grounded i
         "files_to_avoid": normalize_list(supervisor_plan.get("files_to_avoid", [])),
         "constraints": constraints,
         "steps": normalize_list(supervisor_plan.get("corrected_steps", [])),
-        "evidence": supervisor_plan.get("evidence", []),
+        "evidence": filtered_worker_evidence,
     }
 
     print("\n=== Worker routing ===")
